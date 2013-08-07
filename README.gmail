@@ -1,0 +1,10 @@
+This is what we use to backup old imap accounts from gmail. Tweaked to download
+multiple mails at once. Much faster than the original, especially for large
+mailboxes. Picks up from where it left off. Assumes that the mailbox
+is inactive (no one is deleting mails) while in progress.
+
+Usage:
+
+For a full backup of all mail in foo.bar's gmail account,
+
+python imapbackup.py -e -s imap.gmail.com -f "[Gmail]/All Mail" -u foo.bar@domain.com -p password

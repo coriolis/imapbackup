@@ -42,6 +42,9 @@ __contributors__ = "Bob Ippolito, Michael Leonhard, Giuseppe Scrivano <gscrivano
 import getpass, os, gc, sys, time, platform, getopt
 import mailbox, imaplib, socket
 import re, hashlib, gzip, bz2
+import json
+from email.parser import Parser
+import email.utils
  
 class SkipFolderException(Exception):
   """Indicates aborting processing of current folder, continue with next folder."""
@@ -59,10 +62,10 @@ class Spinner:
     sys.stdout.flush()
     self.spin()
  
-  def spin(self):
+  def spin(self, progress=""):
     """Rotate the spinner"""
     if sys.stdin.isatty():
-      sys.stdout.write("\r" + self.message + " " + self.glyphs[self.pos])
+      sys.stdout.write("\r" + self.message + " " + self.glyphs[self.pos] + " " + progress)
       sys.stdout.flush()
       self.pos = (self.pos+1) % len(self.glyphs)
  
@@ -91,10 +94,102 @@ def pretty_byte_count(num):
  
 # Regular expressions for parsing
 MSGID_RE = re.compile("^Message\-Id\: (.+)", re.IGNORECASE + re.MULTILINE)
+SIZE_RE = re.compile("^(.+) \(RFC822.SIZE (.+)\)", re.IGNORECASE)
 BLANKS_RE = re.compile(r'\s+', re.MULTILINE)
  
 # Constants
 UUID = '19AF1258-1AAF-44EF-9D9A-731079D6FAD7' # Used to generate Message-Ids
+
+def download_messages2(server, filename, messages, config):
+  """Download messages from folder and append to mailbox"""
+ 
+  if config['overwrite']:
+    if os.path.exists(filename):
+      print "Deleting", filename
+      os.remove(filename)
+    return []
+  else:
+    assert('bzip2' != config['compress'])
+ 
+  # Open disk file
+  if config['compress'] == 'gzip':
+    mbox = gzip.GzipFile(filename, 'ab', 9)
+  elif config['compress'] == 'bzip2':
+    mbox = bz2.BZ2File(filename, 'wb', 512*1024, 9)
+  else:
+    mbox = file(filename, 'ab')
+ 
+  # the folder has already been selected by scanFolder()
+ 
+  # nothing to do
+  if not len(messages):
+    print "New messages: 0"
+    mbox.close()
+    return
+ 
+  spinner = Spinner("Downloading %s new messages to %s" % (len(messages), filename))
+  total = biggest = 0
+ 
+  # each new message
+  msglist = [{'msgid': k, 'num': v['num'], 'size': v['size']} for k, v in messages.iteritems()]
+  msglist = sorted(msglist, key=lambda x: x['num'], reverse=True)
+  num_to_msgid = {}
+  for k, v in messages.iteritems():
+    num_to_msgid[v['num']] = k
+  m = 0
+  left = nmsgs = len(msglist)
+  chunksize = 1024 * 1024 * 5 # Get at most 5 MB in 1 request
+  maxfetch = 500 # Get at most so many mails in 1 request
+  parser = Parser()
+  while left > 0:
+    first = last = 0
+    tofetch_size = 0
+    while len(msglist) and last - first + 1 < maxfetch and tofetch_size < chunksize:
+      item = msglist[-1]
+      if first == 0:
+        first = last = item['num']
+      elif item['num'] != last + 1:
+        break
+      msglist.pop()
+      last = item['num']
+      tofetch_size += item['size']
+      left -= 1
+    typ, data = server.fetch('%d:%d' % (first, last), "RFC822")
+    assert('OK' == typ)
+
+    for d in data:
+      if d == ')':
+        continue
+      text = d[1].strip().replace('\r', '')
+      buf = "From nobody %s\n" % time.strftime('%a %b %d %H:%M:%S %Y') 
+      n = int(d[0].split(' ')[0])
+      msg_id = num_to_msgid[n]
+      try:
+        header = parser.parsestr(text)
+        date = time.asctime(email.utils.parsedate(header['Date']))
+        realname, emailaddr = email.utils.parseaddr(header['From'])
+        buf = "From %s %s\n" % (emailaddr or 'nobody', date)
+      except Exception, e:
+        print "EXCEPT", str(e)
+        pass
+      if UUID in msg_id:
+        buf = buf + "Message-Id: %s\n" % msg_id
+      mbox.write(buf)
+      mbox.write(text)
+      mbox.write('\n\n')
+      size = len(text)
+      biggest = max(size, biggest)
+      total += size
+      m += 1
+      spinner.spin("%d/%d" % (m, nmsgs))
+
+    del data
+    gc.collect()
+ 
+  mbox.close()
+  spinner.stop()
+  print ": %s total, %s for largest message" % (pretty_byte_count(total),
+                                                pretty_byte_count(biggest))
  
 def download_messages(server, filename, messages, config):
   """Download messages from folder and append to mailbox"""
@@ -127,6 +222,7 @@ def download_messages(server, filename, messages, config):
   total = biggest = 0
  
   # each new message
+  m = 0
   for msg_id in messages.keys():
     # This "From" and the terminating newline below delimit messages
     # in mbox files
@@ -150,7 +246,8 @@ def download_messages(server, filename, messages, config):
  
     del data
     gc.collect()
-    spinner.spin()
+    m += 1
+    spinner.spin("%d/%d" % (m, nmsgs))
  
   mbox.close()
   spinner.stop()
@@ -216,18 +313,113 @@ def scan_file(filename, compress, overwrite):
   print ": %d messages" % (len(messages.keys()))
   return messages
  
+def scan_folder2(server, foldername):
+  """Gets IDs of messages in the specified folder, returns id:num dict"""
+  messages = {}
+  spinner = Spinner("Folder %s" % (foldername))
+  try:
+    msgcachefile = foldername.replace('/', '_') + '.json'
+    maxseen = 0
+    try:
+        with open(msgcachefile, "r") as f:
+            messages = json.loads(f.read())
+            maxseen = max([m['num'] for m in messages.values()])
+    except:
+        pass
+    typ, data = server.select(foldername, readonly=True)
+    if 'OK' != typ:
+      raise SkipFolderException("SELECT failed: %s" % (data))
+    num_msgs = int(data[0])
+ 
+    chunksize = 1000
+    num = maxseen
+    left = num_msgs - maxseen
+    while left > 0:
+      last = num + chunksize if left > chunksize else num + left
+      # Retrieve Message-Id, making sure we don't mark all messages as read
+      typ, data = server.fetch('%d:%d' % (num + 1, last), '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
+      if 'OK' != typ:
+        raise SkipFolderException("FETCH %s failed: %s" % (num, data))
+      typ, sizes = server.fetch('%d:%d' % (num + 1, last), '(RFC822.SIZE)')
+      if 'OK' != typ:
+        raise SkipFolderException("FETCH %s failed: %s" % (num, sizes))
+      num = last
+      left = num_msgs - num
+ 
+      sizedict = {}
+      for s in sizes:
+        try:
+          m = SIZE_RE.match(s)
+          n = m.group(1)
+          size = m.group(2)
+          sizedict[n] = int(size)
+        except:
+          pass
+
+      for d in data:
+        if len(d) != 2:
+          continue
+        header = d[1].strip()
+        try:
+          n = int(d[0].split(' ')[0])
+        except:
+          raise SkipFolderException("FETCH %s failed: %s" % (num, d))
+        # remove newlines inside Message-Id (a dumb Exchange trait)
+        header = BLANKS_RE.sub(' ', header)
+        try:
+          msg_id = MSGID_RE.match(header).group(1) 
+          if msg_id not in messages.keys():
+            # avoid adding dupes
+            messages[msg_id] = {'num': n, 'size': sizedict.get(str(n), (1024 * 1024))}
+        except (IndexError, AttributeError):
+          # Some messages may have no Message-Id, so we'll synthesise one
+          # (this usually happens with Sent, Drafts and .Mac news)
+          typ, data = server.fetch(n, '(BODY[HEADER.FIELDS (FROM TO CC DATE SUBJECT)])')
+          if 'OK' != typ:
+            raise SkipFolderException("FETCH %s failed: %s" % (n, data))
+          header = data[0][1].strip()
+          header = header.replace('\r\n','\t')
+          messages['<' + UUID + '.' + hashlib.sha1(header).hexdigest() + '>'] = {'num': n, 'size': sizedict.get(n, (1024 * 1024))}
+        spinner.spin("%d/%d" % (n, num_msgs))
+
+      try:
+        with open(msgcachefile, "w") as f:
+          f.write(json.dumps(messages, indent=4) + '\n')
+          f.flush()
+      except Exception, e:
+        print "EXCEPT ", str(e)
+        pass
+      del data
+      del sizes
+      gc.collect()
+  finally:
+    spinner.stop()
+    print ":",
+ 
+  # done
+  print "%d messages" % (len(messages.keys()))
+  return messages
+
 def scan_folder(server, foldername):
   """Gets IDs of messages in the specified folder, returns id:num dict"""
   messages = {}
   spinner = Spinner("Folder %s" % (foldername))
   try:
+    msgcachefile = foldername.replace('/', '_') + '.json'
+    maxseen = 1
+    try:
+        with open(msgcachefile, "r") as f:
+            messages = json.loads(f.read())
+            maxseen = max(messages.values())
+    except:
+        pass
     typ, data = server.select(foldername, readonly=True)
     if 'OK' != typ:
       raise SkipFolderException("SELECT failed: %s" % (data))
     num_msgs = int(data[0])
  
     # each message
-    for num in range(1, num_msgs+1):
+    for num in range(maxseen, num_msgs+1):
       # Retrieve Message-Id, making sure we don't mark all messages as read
       typ, data = server.fetch(num, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
       if 'OK' != typ:
@@ -241,6 +433,11 @@ def scan_folder(server, foldername):
         if msg_id not in messages.keys():
           # avoid adding dupes
           messages[msg_id] = num
+        try:
+            with open(msgcachefile, "w") as f:
+                f.write(json.dumps(messages, indent=4) + '\n')
+        except:
+            pass
       except (IndexError, AttributeError):
         # Some messages may have no Message-Id, so we'll synthesise one
         # (this usually happens with Sent, Drafts and .Mac news)
@@ -250,7 +447,7 @@ def scan_folder(server, foldername):
         header = data[0][1].strip()
         header = header.replace('\r\n','\t')
         messages['<' + UUID + '.' + hashlib.sha1(header).hexdigest() + '>'] = num
-      spinner.spin()
+      spinner.spin("%d/%d" % (num, num_msgs + 1))
   finally:
     spinner.stop()
     print ":",
@@ -557,7 +754,7 @@ def main():
     for name_pair in names:
       try:
         foldername, filename = name_pair
-        fol_messages = scan_folder(server, foldername)
+        fol_messages = scan_folder2(server, foldername)
         fil_messages = scan_file(filename, config['compress'], config['overwrite'])
  
         new_messages = {}
@@ -568,7 +765,7 @@ def main():
         #for f in new_messages:
         #  print "%s : %s" % (f, new_messages[f])
  
-        download_messages(server, filename, new_messages, config)
+        download_messages2(server, filename, new_messages, config)
  
       except SkipFolderException, e:
         print e
